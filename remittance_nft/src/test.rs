@@ -818,21 +818,26 @@ fn test_transfer_moves_identity_state_to_new_wallet() {
         &None,
     );
     client.update_score(&old_wallet, &300, &None);
-    client.record_default(&old_wallet, &None);
+    // update_score adds a score-history entry and bumps the score.
+    // NOTE: we deliberately do NOT call record_default here because that would
+    // seize the sender and block the transfer (see test_transfer_blocked_for_seized_user).
 
     client.transfer(&old_wallet, &new_wallet, &None);
 
+    // Old wallet is clean after transfer.
     assert!(client.get_metadata(&old_wallet).is_none());
     assert_eq!(client.get_score(&old_wallet), 0);
     assert_eq!(client.get_default_count(&old_wallet), 0);
     assert!(!client.is_seized(&old_wallet));
     assert_eq!(client.get_score_history(&old_wallet, &0, &10).len(), 0);
 
+    // New wallet receives the identity state.
     let metadata = client.get_metadata(&new_wallet).unwrap();
     assert_eq!(metadata.score, 503);
     assert_eq!(metadata.history_hash, create_test_hash(&env, 21));
-    assert_eq!(client.get_default_count(&new_wallet), 1);
-    assert!(client.is_seized(&new_wallet));
+    // No defaults were recorded so default_count is 0 and seized is false.
+    assert_eq!(client.get_default_count(&new_wallet), 0);
+    assert!(!client.is_seized(&new_wallet));
     assert_eq!(client.get_score_history(&new_wallet, &0, &10).len(), 1);
 }
 
@@ -1790,4 +1795,139 @@ fn test_score_history_max_50_entries() {
         .get(RemittanceNFT::MAX_SCORE_HISTORY_ENTRIES - 1)
         .unwrap();
     assert_eq!(last_entry.ledger, 60);
+}
+
+// ── Transfer eligibility rules ────────────────────────────────────────────────
+//
+// A transfer is blocked when:
+//   1. The sender's NFT collateral has been seized (`is_seized` is true).
+//      The seized/default reputation state cannot be shed by moving the NFT
+//      to a fresh address.
+//   2. An active (approved) loan is outstanding for the sender, as signalled
+//      by the loan manager via `set_active_loan_holder`.
+//      The NFT must stay with the borrower until the loan is closed.
+//
+// Normal transfers (clean NFT, no active loan) continue to work as before.
+
+/// A seized user cannot transfer their NFT to escape the seized flag.
+#[test]
+fn test_transfer_blocked_for_seized_user() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.mint(
+        &borrower,
+        &600,
+        &create_test_hash(&env, 30),
+        &create_test_uri(&env),
+        &None,
+    );
+    client.seize_collateral(&borrower, &None);
+
+    assert!(client.is_seized(&borrower));
+
+    let result = client.try_transfer(&borrower, &recipient, &None);
+    assert_eq!(result, Err(Ok(NftError::TransferSeized)));
+
+    // Recipient is untouched.
+    assert!(client.get_metadata(&recipient).is_none());
+    // Sender still owns the NFT.
+    assert!(client.get_metadata(&borrower).is_some());
+}
+
+/// A borrower with an active (approved) loan cannot transfer their NFT.
+/// Once the loan manager clears the lock the transfer succeeds.
+#[test]
+fn test_transfer_blocked_with_active_loan() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let loan_manager = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+
+    // Register the (mock) loan manager so it is permitted to call
+    // set_active_loan_holder / clear_active_loan_holder.
+    client.set_loan_manager(&loan_manager);
+    assert_eq!(client.get_loan_manager(), Some(loan_manager.clone()));
+
+    client.mint(
+        &borrower,
+        &700,
+        &create_test_hash(&env, 31),
+        &create_test_uri(&env),
+        &None,
+    );
+
+    // Loan manager signals that a loan is now active.
+    client.set_active_loan_holder(&borrower);
+    assert!(client.has_active_loan(&borrower));
+
+    // Transfer must be blocked.
+    let result = client.try_transfer(&borrower, &recipient, &None);
+    assert_eq!(result, Err(Ok(NftError::TransferActiveLoan)));
+
+    // NFT is still with the borrower.
+    assert!(client.get_metadata(&borrower).is_some());
+    assert!(client.get_metadata(&recipient).is_none());
+
+    // Loan manager clears the lock after the loan is repaid/closed.
+    client.clear_active_loan_holder(&borrower);
+    assert!(!client.has_active_loan(&borrower));
+
+    // Transfer now succeeds (cooldown starts on the recipient).
+    client.transfer(&borrower, &recipient, &None);
+
+    assert!(client.get_metadata(&borrower).is_none());
+    assert!(client.get_metadata(&recipient).is_some());
+}
+
+/// Only the registered loan manager may call set_active_loan_holder.
+#[test]
+#[should_panic]
+fn test_set_active_loan_holder_requires_loan_manager() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // No loan manager registered — call must panic with NotLoanManager.
+    client.set_active_loan_holder(&borrower);
+}
+
+/// Only the registered loan manager may call clear_active_loan_holder.
+#[test]
+#[should_panic]
+fn test_clear_active_loan_holder_requires_loan_manager() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // No loan manager registered — call must panic with NotLoanManager.
+    client.clear_active_loan_holder(&borrower);
 }

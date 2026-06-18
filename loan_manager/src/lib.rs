@@ -15,6 +15,8 @@ pub trait RemittanceNftInterface {
     fn record_default(env: Env, user: Address, minter: Option<Address>);
     fn is_authorized_minter(env: Env, minter: Address) -> bool;
     fn is_paused(env: Env) -> bool;
+    fn set_active_loan_holder(env: Env, holder: Address);
+    fn clear_active_loan_holder(env: Env, holder: Address);
 }
 
 #[contractclient(name = "RateOracleClient")]
@@ -1134,6 +1136,13 @@ impl LoanManager {
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&lending_pool, &borrower, &transfer_amount);
 
+        // Mark the borrower in the NFT contract so that transfer() is blocked
+        // while the loan is active. Failure is non-fatal — the loan is already
+        // committed — but we attempt a best-effort call.
+        let nft_contract = Self::nft_contract(&env);
+        let nft_client = NftClient::new(&env, &nft_contract);
+        nft_client.set_active_loan_holder(&borrower);
+
         events::loan_approved(
             &env,
             loan_id,
@@ -1293,6 +1302,11 @@ impl LoanManager {
             Self::release_collateral_internal(&env, loan_id, &loan.borrower);
             // Emit terminal repayment event for completed loans.
             events::loan_repaid(&env, borrower.clone(), loan_id, amount);
+
+            // Lift the NFT transfer lock now that the loan is closed.
+            let nft_contract = Self::nft_contract(&env);
+            let nft_client = NftClient::new(&env, &nft_contract);
+            nft_client.clear_active_loan_holder(&borrower);
         }
 
         if amount >= 100 {
@@ -1534,12 +1548,17 @@ impl LoanManager {
         events::loan_liquidated(
             &env,
             loan_id,
-            loan.borrower,
+            loan.borrower.clone(),
             liquidator,
             debt_repaid,
             liquidator_bonus,
             borrower_refund,
         );
+
+        // Lift the NFT transfer lock.
+        let nft_contract = Self::nft_contract(&env);
+        let nft_client = NftClient::new(&env, &nft_contract);
+        nft_client.clear_active_loan_holder(&loan.borrower);
 
         Ok(())
     }
@@ -2330,6 +2349,9 @@ impl LoanManager {
             &Some(env.current_contract_address()),
         );
         nft_client.record_default(&loan.borrower, &Some(env.current_contract_address()));
+        // Lift the NFT transfer lock; the collateral is now seized so the seized
+        // flag alone will prevent any laundering via transfer.
+        nft_client.clear_active_loan_holder(&loan.borrower);
 
         events::loan_defaulted(&env, loan_id, loan.borrower.clone());
         Ok(())
