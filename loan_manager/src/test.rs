@@ -1493,6 +1493,62 @@ fn test_liquidate_under_threshold_transfers_bonus_and_refund() {
 }
 
 #[test]
+fn test_liquidation_frees_outstanding_for_approve_loan() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (manager, nft_client, pool_client, token_id, _token_admin) = setup_test(&env);
+    let borrower_one = Address::generate(&env);
+    let borrower_two = Address::generate(&env);
+    let liquidator = Address::generate(&env);
+
+    let history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    nft_client.mint(
+        &borrower_one,
+        &650,
+        &history_hash,
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+    nft_client.mint(
+        &borrower_two,
+        &650,
+        &history_hash,
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+
+    let stellar_token = StellarAssetClient::new(&env, &token_id);
+    stellar_token.mint(&pool_client, &10_000);
+    stellar_token.mint(&borrower_one, &20_000);
+
+    manager.set_liquidation_threshold(&14_500);
+
+    let first_loan = manager.request_loan(&borrower_one, &6_000, &17_280);
+    let second_loan = manager.request_loan(&borrower_two, &6_000, &17_280);
+    manager.approve_loan(&first_loan);
+    manager.deposit_collateral(&first_loan, &8_500);
+
+    let blocked_before_liquidation = manager.try_approve_loan(&second_loan);
+    assert_eq!(
+        blocked_before_liquidation,
+        Err(Ok(LoanError::InsufficientPoolLiquidity))
+    );
+
+    manager.liquidate(&liquidator, &first_loan);
+
+    assert_eq!(
+        manager.get_loan(&first_loan).status,
+        LoanStatus::Liquidated
+    );
+    manager.approve_loan(&second_loan);
+    assert_eq!(
+        manager.get_loan(&second_loan).status,
+        LoanStatus::Approved
+    );
+}
+
+#[test]
 fn test_liquidate_rejects_healthy_collateral_ratio() {
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();

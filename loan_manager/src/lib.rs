@@ -1495,17 +1495,20 @@ impl LoanManager {
         };
 
         Self::apply_debt_recovery(&mut loan, debt_repaid);
-        loan.status = LoanStatus::Liquidated;
-        loan.collateral_amount = 0;
-        env.storage().persistent().set(&loan_key, &loan);
-        Self::bump_persistent_ttl(&env, &loan_key);
-        Self::decrement_borrower_loan_count(&env, &loan.borrower);
 
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::Token)
             .expect("token not set");
+        Self::adjust_total_outstanding(&env, &token, -loan.amount);
+
+        loan.status = LoanStatus::Liquidated;
+        loan.collateral_amount = 0;
+        env.storage().persistent().set(&loan_key, &loan);
+        Self::bump_persistent_ttl(&env, &loan_key);
+        Self::decrement_borrower_loan_count(&env, &loan.borrower);
+
         let lending_pool: Address = env
             .storage()
             .instance()
