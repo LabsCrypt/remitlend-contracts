@@ -2892,3 +2892,106 @@ fn test_collateral_release_works_while_paused() {
     // Cancel on a repaid loan should fail with InvalidLoanStatus, not ContractPaused
     assert!(result.is_err());
 }
+
+// ── BorrowerLoanCount decrement on cancel / reject (issue #16) ────────────────
+
+#[test]
+fn test_cancel_loan_decrements_borrower_count() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (client, nft_client, pool_client, token_id, _admin) = setup_test(&env);
+    let borrower = Address::generate(&env);
+
+    nft_client.mint(
+        &borrower,
+        &600,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+    let stellar_token = StellarAssetClient::new(&env, &token_id);
+    stellar_token.mint(&pool_client, &10_000);
+
+    let loan_id = client.request_loan(&borrower, &500, &17280);
+    assert_eq!(client.get_borrower_loan_count(&borrower), 1);
+
+    client.cancel_loan(&borrower, &loan_id);
+    assert_eq!(client.get_borrower_loan_count(&borrower), 0);
+}
+
+#[test]
+fn test_reject_loan_decrements_borrower_count() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (client, nft_client, pool_client, token_id, _admin) = setup_test(&env);
+    let borrower = Address::generate(&env);
+
+    nft_client.mint(
+        &borrower,
+        &600,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+    let stellar_token = StellarAssetClient::new(&env, &token_id);
+    stellar_token.mint(&pool_client, &10_000);
+
+    let loan_id = client.request_loan(&borrower, &500, &17280);
+    assert_eq!(client.get_borrower_loan_count(&borrower), 1);
+
+    client.reject_loan(&loan_id, &String::from_str(&env, "not eligible"));
+    assert_eq!(client.get_borrower_loan_count(&borrower), 0);
+}
+
+#[test]
+fn test_borrower_can_rerequest_after_cancel_and_reject_at_cap() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (client, nft_client, pool_client, token_id, _admin) = setup_test(&env);
+    let borrower = Address::generate(&env);
+
+    nft_client.mint(
+        &borrower,
+        &600,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+    let stellar_token = StellarAssetClient::new(&env, &token_id);
+    stellar_token.mint(&pool_client, &10_000);
+
+    // Set cap to 2
+    client.set_max_loans_per_borrower(&2);
+
+    // Fill to cap
+    let loan_id_1 = client.request_loan(&borrower, &500, &17280);
+    let loan_id_2 = client.request_loan(&borrower, &500, &17280);
+    assert_eq!(client.get_borrower_loan_count(&borrower), 2);
+
+    // A third request must be blocked
+    let over_cap = client.try_request_loan(&borrower, &500, &17280);
+    assert_eq!(over_cap, Err(Ok(LoanError::MaxLoansReached)));
+
+    // Cancel loan #1 — slot is freed
+    client.cancel_loan(&borrower, &loan_id_1);
+    assert_eq!(client.get_borrower_loan_count(&borrower), 1);
+
+    // Now a new request must succeed
+    let loan_id_3 = client.request_loan(&borrower, &500, &17280);
+    assert_eq!(client.get_borrower_loan_count(&borrower), 2);
+    let loan_3 = client.get_loan(&loan_id_3);
+    assert_eq!(loan_3.status, LoanStatus::Pending);
+
+    // Reject loan #2 — slot is freed
+    client.reject_loan(&loan_id_2, &String::from_str(&env, "policy"));
+    assert_eq!(client.get_borrower_loan_count(&borrower), 1);
+
+    // Another new request must succeed
+    let loan_id_4 = client.request_loan(&borrower, &500, &17280);
+    assert_eq!(client.get_borrower_loan_count(&borrower), 2);
+    let loan_4 = client.get_loan(&loan_id_4);
+    assert_eq!(loan_4.status, LoanStatus::Pending);
+}
