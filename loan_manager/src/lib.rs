@@ -1146,6 +1146,8 @@ impl LoanManager {
         Ok(())
     }
 
+    /// Returns a projected (non-persisted) snapshot of the loan, including accrued interest and late fees up to the current ledger.
+    /// This state is NOT written back to storage. For the exact amount required to clear the debt, use `quote_total_debt`.
     pub fn get_loan(env: Env, loan_id: u32) -> Result<Loan, LoanError> {
         let loan_key = DataKey::Loan(loan_id);
         let mut loan: Loan = env
@@ -1583,6 +1585,7 @@ impl LoanManager {
         loan.collateral_amount = 0;
         env.storage().persistent().set(&loan_key, &loan);
         Self::bump_persistent_ttl(&env, &loan_key);
+        Self::decrement_borrower_loan_count(&env, &borrower);
 
         if collateral_to_release > 0 {
             use soroban_sdk::token::TokenClient;
@@ -1625,6 +1628,7 @@ impl LoanManager {
         loan.collateral_amount = 0;
         env.storage().persistent().set(&loan_key, &loan);
         Self::bump_persistent_ttl(&env, &loan_key);
+        Self::decrement_borrower_loan_count(&env, &loan.borrower);
 
         if collateral_to_release > 0 {
             use soroban_sdk::token::TokenClient;
