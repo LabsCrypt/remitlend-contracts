@@ -40,6 +40,10 @@ fn setup_test<'a>(
     // 5. Initialize the Loan Manager with the NFT contract, lending pool, token, and admin
     loan_manager_client.initialize(&nft_contract_id, &pool_contract_id, &token_id, &admin);
 
+    // Register the loan manager in the NFT contract so it can call
+    // set_active_loan_holder / clear_active_loan_holder.
+    nft_client.set_loan_manager(&loan_manager_id);
+
     // Disable dust spam protection for the loan manager tests
     nft_client.set_min_repayment_amount(&0);
 

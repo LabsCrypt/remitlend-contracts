@@ -25,6 +25,12 @@ pub enum NftError {
     RemintNotApproved = 16,
     BelowMinimum = 17,
     InvalidMetadataUri = 18,
+    /// Transfer blocked because the NFT owner's collateral has been seized.
+    TransferSeized = 19,
+    /// Transfer blocked because the NFT is tied to an active (approved) loan.
+    TransferActiveLoan = 20,
+    /// Caller is not the authorised loan manager contract.
+    NotLoanManager = 21,
 }
 
 #[contracttype]
@@ -60,6 +66,12 @@ pub enum DataKey {
     Paused,
     ProposedAdmin,
     MinRepaymentAmount,
+    /// Set to `true` when an approved loan is outstanding for the given address.
+    /// Cleared when the loan is fully repaid, defaulted, cancelled, or liquidated.
+    ActiveLoanHolder(Address),
+    /// The address of the authorised loan manager contract permitted to call
+    /// `set_active_loan_holder` and `clear_active_loan_holder`.
+    LoanManager,
 }
 
 #[contract]
@@ -756,6 +768,25 @@ impl RemittanceNFT {
     /// This ensures that a seized borrower retains a path to clear
     /// their outstanding debt and avoid permanent bad-debt accumulation
     /// in the lending pool.
+    ///
+    /// # Transfer eligibility rules
+    /// An NFT transfer is permitted only when **all** of the following hold:
+    ///
+    /// 1. `is_seized` is `false` — the collateral has not been seized.
+    ///    A seized borrower cannot offload the NFT to escape the flag;
+    ///    the `DefaultCount` and `Seized` state are non-transferable.
+    ///
+    /// 2. `has_active_loan` is `false` — no approved loan is outstanding
+    ///    for the holder (as set by the loan manager via
+    ///    [`set_active_loan_holder`]).  The NFT must remain with the
+    ///    borrower until the loan is closed (repaid, defaulted, liquidated,
+    ///    or cancelled).
+    ///
+    /// 3. No active transfer cooldown (`TransferCooldownActive`).
+    ///
+    /// When either condition 1 or 2 is violated, `transfer()` returns
+    /// [`NftError::TransferSeized`] or [`NftError::TransferActiveLoan`]
+    /// respectively and the NFT is not moved.
     pub fn seize_collateral(
         env: Env,
         user: Address,
@@ -832,6 +863,65 @@ impl RemittanceNFT {
         Ok(())
     }
 
+    /// Register the loan manager contract address.
+    /// Only the NFT admin may call this.  Must be set before the loan manager
+    /// can invoke `set_active_loan_holder` or `clear_active_loan_holder`.
+    pub fn set_loan_manager(env: Env, loan_manager: Address) {
+        Self::admin(&env).require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::LoanManager, &loan_manager);
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Return the registered loan manager address, or None if not configured.
+    pub fn get_loan_manager(env: Env) -> Option<Address> {
+        Self::bump_instance_ttl(&env);
+        env.storage().instance().get(&DataKey::LoanManager)
+    }
+
+    fn require_loan_manager(env: &Env) -> Result<(), NftError> {
+        let loan_manager: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LoanManager)
+            .ok_or(NftError::NotLoanManager)?;
+        loan_manager.require_auth();
+        Ok(())
+    }
+
+    /// Called by the loan manager when a loan for `holder` transitions to
+    /// Approved status.  Marks the address as having an active loan so that
+    /// `transfer()` will reject any attempt to move the NFT.
+    pub fn set_active_loan_holder(env: Env, holder: Address) -> Result<(), NftError> {
+        Self::require_loan_manager(&env)?;
+        let key = DataKey::ActiveLoanHolder(holder.clone());
+        env.storage().persistent().set(&key, &true);
+        Self::bump_persistent_ttl(&env, &key);
+        Ok(())
+    }
+
+    /// Called by the loan manager when the active loan for `holder` is fully
+    /// repaid, defaulted, liquidated, or cancelled.  Clears the active-loan
+    /// lock so that the NFT may be transferred again.
+    pub fn clear_active_loan_holder(env: Env, holder: Address) -> Result<(), NftError> {
+        Self::require_loan_manager(&env)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ActiveLoanHolder(holder));
+        Ok(())
+    }
+
+    /// Returns `true` when `holder` has an active (approved) loan outstanding.
+    pub fn has_active_loan(env: Env, holder: Address) -> bool {
+        let key = DataKey::ActiveLoanHolder(holder);
+        let active = env.storage().persistent().has(&key);
+        if active {
+            Self::bump_persistent_ttl(&env, &key);
+        }
+        active
+    }
+
     pub fn transfer(
         env: Env,
         from: Address,
@@ -858,6 +948,19 @@ impl RemittanceNFT {
         }
 
         let metadata = Self::get_or_migrate_metadata(&env, &from).ok_or(NftError::NftNotFound)?;
+
+        // Block transfer if the sender's collateral has been seized.
+        // Seized status cannot be shed by moving the NFT to a fresh address.
+        let seized_key = DataKey::Seized(from.clone());
+        if env.storage().persistent().has(&seized_key) {
+            return Err(NftError::TransferSeized);
+        }
+
+        // Block transfer while an active (approved) loan references this holder.
+        let active_loan_key = DataKey::ActiveLoanHolder(from.clone());
+        if env.storage().persistent().has(&active_loan_key) {
+            return Err(NftError::TransferActiveLoan);
+        }
 
         if Self::has_any_remittance_state(&env, &to) {
             return Err(NftError::DestinationOccupied);
@@ -896,14 +999,6 @@ impl RemittanceNFT {
                 .set(&to_default_key, &default_count);
             Self::bump_persistent_ttl(&env, &to_default_key);
             env.storage().persistent().remove(&from_default_key);
-        }
-
-        let from_seized_key = DataKey::Seized(from.clone());
-        if env.storage().persistent().has(&from_seized_key) {
-            let to_seized_key = DataKey::Seized(to.clone());
-            env.storage().persistent().set(&to_seized_key, &true);
-            Self::bump_persistent_ttl(&env, &to_seized_key);
-            env.storage().persistent().remove(&from_seized_key);
         }
 
         env.storage()
