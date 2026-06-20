@@ -1701,7 +1701,7 @@ fn test_get_borrower_loans() {
 
     // Request second loan (while first is still pending)
     let loan_id_2 = manager.request_loan(&borrower, &500, &17280);
-let borrower_loans = manager.get_borrower_loans(&borrower);
+    let borrower_loans = manager.get_borrower_loans(&borrower);
     assert_eq!(borrower_loans.len(), 2);
     assert_eq!(borrower_loans.get(0).unwrap(), loan_id_1);
     assert_eq!(borrower_loans.get(1).unwrap(), loan_id_2);

@@ -2070,7 +2070,11 @@ impl LoanManager {
 
     /// Returns loan IDs for a borrower filtered by status, without triggering accrual.
     /// This allows indexers to query only loans in a specific state.
-    pub fn get_borrower_loans_by_status(env: Env, borrower: Address, status: LoanStatus) -> Vec<u32> {
+    pub fn get_borrower_loans_by_status(
+        env: Env,
+        borrower: Address,
+        status: LoanStatus,
+    ) -> Vec<u32> {
         Self::bump_instance_ttl(&env);
         let all_loans: Vec<u32> = env
             .storage()
