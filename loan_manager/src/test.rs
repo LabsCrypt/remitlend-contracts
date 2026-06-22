@@ -1537,15 +1537,9 @@ fn test_liquidation_frees_outstanding_for_approve_loan() {
 
     manager.liquidate(&liquidator, &first_loan);
 
-    assert_eq!(
-        manager.get_loan(&first_loan).status,
-        LoanStatus::Liquidated
-    );
+    assert_eq!(manager.get_loan(&first_loan).status, LoanStatus::Liquidated);
     manager.approve_loan(&second_loan);
-    assert_eq!(
-        manager.get_loan(&second_loan).status,
-        LoanStatus::Approved
-    );
+    assert_eq!(manager.get_loan(&second_loan).status, LoanStatus::Approved);
 }
 
 #[test]
