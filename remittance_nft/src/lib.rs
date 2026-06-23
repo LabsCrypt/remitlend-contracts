@@ -13,7 +13,6 @@ pub enum NftError {
     NftAlreadyExists = 4,
     BurnedRequiresApproval = 5,
     NftNotFound = 6,
-    InvalidRepaymentAmount = 7,
     CollateralAlreadySeized = 8,
     SelfTransfer = 9,
     DestinationOccupied = 10,
@@ -83,7 +82,7 @@ impl RemittanceNFT {
     /// Dust repayments below this threshold award 0 score points due to integer
     /// division (`repayment_amount / 100 == 0`) but still write storage and emit
     /// events, enabling spam attacks. This floor rejects such calls early with
-    /// InvalidRepaymentAmount (error 7).
+    /// BelowMinimum (error 17).
     pub const MIN_SCORE_UPDATE_REPAYMENT: i128 = 100;
 
     fn admin_key() -> soroban_sdk::Symbol {
@@ -572,26 +571,31 @@ impl RemittanceNFT {
             .unwrap_or(0)
     }
 
-    /// Update the score for a user's NFT based on a repayment amount.
+    /// Updates the reputation score of a user's NFT based on their repayment amount.
+    ///
+    /// # Validation
+    /// Consolidates repayment validation into a single floor check. The repayment amount
+    /// must be at least the effective floor, which is the maximum of the configured
+    /// minimum repayment amount (`min_repayment`) and the fixed update threshold
+    /// (`MIN_SCORE_UPDATE_REPAYMENT`, which is 100).
+    ///
+    /// # Errors
+    /// Returns `NftError::BelowMinimum` if the repayment amount is less than the
+    /// effective floor.
     pub fn update_score(
         env: Env,
         user: Address,
         repayment_amount: i128,
         minter: Option<Address>,
     ) -> Result<(), NftError> {
-        if repayment_amount <= 0 {
-            return Err(NftError::InvalidRepaymentAmount);
-        }
-
         let min_repayment = Self::min_repayment_amount(&env);
-        if repayment_amount < min_repayment {
-            return Err(NftError::BelowMinimum);
-        }
+        let effective_floor = min_repayment.max(Self::MIN_SCORE_UPDATE_REPAYMENT);
 
-        // Reject dust repayments that award zero score points (repayment_amount / 100 == 0)
-        // but still incur storage writes and event emissions, enabling low-cost spam.
-        if repayment_amount < Self::MIN_SCORE_UPDATE_REPAYMENT {
-            return Err(NftError::InvalidRepaymentAmount);
+        // Single consolidated floor check: the repayment amount must be at least the effective floor.
+        // This keeps `BelowMinimum` as the surviving error variant to describe consolidated floor check semantics,
+        // and also rejects non-positive repayments since the effective floor is always >= 100.
+        if repayment_amount < effective_floor {
+            return Err(NftError::BelowMinimum);
         }
         Self::require_admin_or_authorized_minter(&env, minter)?;
 
@@ -601,9 +605,11 @@ impl RemittanceNFT {
 
         // Simple logic: 1 point per 100 units of repayment.
         let points_i128 = repayment_amount / 100;
-        if points_i128 == 0 {
-            return Ok(());
-        }
+
+        // Note: The previous check `if points_i128 == 0 { return Ok(()); }` is mathematically
+        // unreachable. Because the floor check guarantees that `repayment_amount >= effective_floor`
+        // where `effective_floor` is at least 100, `points_i128` (calculated as `repayment_amount / 100`)
+        // is guaranteed to be at least 1 (since 100 / 100 = 1). Thus, this check is safe to remove.
         let points = if points_i128 > (Self::MAX_SCORE as i128) {
             Self::MAX_SCORE
         } else {

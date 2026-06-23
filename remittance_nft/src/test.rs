@@ -1791,3 +1791,113 @@ fn test_score_history_max_50_entries() {
         .unwrap();
     assert_eq!(last_entry.ledger, 60);
 }
+
+#[test]
+fn test_update_score_floor_boundary_99() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    let history_hash = create_test_hash(&env, 1);
+    client.mint(&user, &500, &history_hash, &create_test_uri(&env), &None);
+
+    // Default min_repayment is 0, but the fixed floor is 100.
+    // 99 is below the fixed floor.
+    let result = client.try_update_score(&user, &99, &None);
+    assert_eq!(result, Err(Ok(NftError::BelowMinimum)));
+}
+
+#[test]
+fn test_update_score_floor_boundary_100() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    let history_hash = create_test_hash(&env, 1);
+    client.mint(&user, &500, &history_hash, &create_test_uri(&env), &None);
+
+    // Default min_repayment is 0. 100 is exactly at the fixed floor.
+    // Should succeed and add 1 point (100 / 100).
+    client.update_score(&user, &100, &None);
+    assert_eq!(client.get_score(&user), 501);
+}
+
+#[test]
+fn test_update_score_floor_configured_min_150_repay_120() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.set_min_repayment_amount(&150);
+
+    let history_hash = create_test_hash(&env, 1);
+    client.mint(&user, &500, &history_hash, &create_test_uri(&env), &None);
+
+    // 120 is above 100 but below the configured min_repayment of 150.
+    let result = client.try_update_score(&user, &120, &None);
+    assert_eq!(result, Err(Ok(NftError::BelowMinimum)));
+}
+
+#[test]
+fn test_update_score_floor_exact_effective() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.set_min_repayment_amount(&150); // min_repayment = 150, which is > 100. Effective floor is 150.
+
+    let history_hash = create_test_hash(&env, 1);
+    client.mint(&user, &500, &history_hash, &create_test_uri(&env), &None);
+
+    // 150 is exactly at the effective floor (150).
+    // Should succeed and add 1 point (150 / 100 = 1).
+    client.update_score(&user, &150, &None);
+    assert_eq!(client.get_score(&user), 501);
+}
+
+#[test]
+fn test_update_score_floor_above_effective() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.set_min_repayment_amount(&150); // Effective floor is 150.
+
+    let history_hash = create_test_hash(&env, 1);
+    client.mint(&user, &500, &history_hash, &create_test_uri(&env), &None);
+
+    // 151 is one unit above the effective floor (150).
+    // Should succeed and add 1 point (151 / 100 = 1).
+    client.update_score(&user, &151, &None);
+    assert_eq!(client.get_score(&user), 501);
+}
