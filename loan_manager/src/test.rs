@@ -2715,6 +2715,46 @@ fn test_refinance_loan_fails_when_score_drops_below_minimum() {
     assert_eq!(manager.get_loan(&loan_id).status, LoanStatus::Approved);
 }
 
+#[test]
+fn test_refinance_loan_fails_with_insufficient_collateral() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (manager, nft_client, pool_client, token_id, _admin) = setup_test(&env);
+    let borrower = Address::generate(&env);
+
+    let history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    nft_client.mint(
+        &borrower,
+        &600,
+        &history_hash,
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+
+    let stellar_token = StellarAssetClient::new(&env, &token_id);
+    stellar_token.mint(&pool_client, &50_000);
+
+    let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
+    manager.approve_loan(&loan_id);
+
+    // Set collateral to 500, which is less than the new_amount of 2_000.
+    stellar_token.mint(&manager.address, &500);
+    env.as_contract(&manager.address, || {
+        let key = DataKey::Loan(loan_id);
+        let mut loan: Loan = env.storage().persistent().get(&key).unwrap();
+        loan.collateral_amount = 500;
+        env.storage().persistent().set(&key, &loan);
+    });
+
+    // Attempting to refinance up to 2_000 must fail with InsufficientCollateral,
+    // not InsufficientScore.
+    let result = manager.try_refinance_loan(&loan_id, &2_000, &17_280);
+    assert_eq!(result, Err(Ok(LoanError::InsufficientCollateral)));
+    // Loan must remain unchanged.
+    assert_eq!(manager.get_loan(&loan_id).status, LoanStatus::Approved);
+}
+
 // ── Pause functionality tests ──────────────────────────────────────────────
 
 #[test]
