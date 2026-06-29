@@ -1932,3 +1932,75 @@ fn test_total_deposits_zero_after_all_shares_redeemed_with_yield() {
     assert_eq!(pool_client.get_total_shares(&token_id), 0);
     assert_eq!(pool_client.get_pool_stats(&token_id).depositor_count, 0);
 }
+
+#[test]
+fn test_fuzz_sanity_invariants() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_id, stellar_asset_client, token_client) = create_token_contract(&env, &token_admin);
+
+    let pool_id = env.register(LendingPool, ());
+    let pool_client = LendingPoolClient::new(&env, &pool_id);
+    pool_client.initialize(&admin);
+    pool_client.set_withdrawal_cooldown(&0);
+
+    // Invariant helper:
+    let assert_no_value_creation = |shares: i128, pool_balance: i128, total_shares: i128, redeemable: i128| {
+        if total_shares == 0 {
+            assert_eq!(redeemable, 0);
+            return;
+        }
+        if let (Some(lhs), Some(rhs)) = (redeemable.checked_mul(total_shares), shares.checked_mul(pool_balance)) {
+            assert!(lhs <= rhs, "Value creation from rounding detected");
+        } else {
+            let q = shares / total_shares;
+            let r = shares % total_shares;
+            if let Some(term1) = q.checked_mul(pool_balance) {
+                if let Some(term2_num) = r.checked_mul(pool_balance) {
+                    let term2 = term2_num / total_shares;
+                    if let Some(max_redeemable) = term1.checked_add(term2) {
+                        assert!(redeemable <= max_redeemable, "Value creation from rounding detected");
+                    }
+                }
+            }
+        }
+    };
+
+    // Action 1: Deposit (positive amount)
+    let user1 = Address::generate(&env);
+    let amount1 = 2000;
+    stellar_asset_client.mint(&user1, &amount1);
+    pool_client.deposit(&user1, &token_id, &amount1);
+
+    let shares1 = pool_client.get_shares(&user1, &token_id);
+    assert!(shares1 > 0, "Shares minted on deposit must be strictly positive");
+    let balance1 = pool_client.get_deposit(&user1, &token_id);
+    assert!(balance1 >= 0, "Balance should never be negative");
+    assert_no_value_creation(shares1, token_client.balance(&pool_id), pool_client.get_total_shares(&token_id), balance1);
+
+    // Action 2: Deposit from another user
+    let user2 = Address::generate(&env);
+    let amount2 = 1500;
+    stellar_asset_client.mint(&user2, &amount2);
+    pool_client.deposit(&user2, &token_id, &amount2);
+
+    let shares2 = pool_client.get_shares(&user2, &token_id);
+    assert!(shares2 > 0, "Shares minted on deposit must be strictly positive");
+    let balance2 = pool_client.get_deposit(&user2, &token_id);
+    assert!(balance2 >= 0, "Balance should never be negative");
+    assert_no_value_creation(shares2, token_client.balance(&pool_id), pool_client.get_total_shares(&token_id), balance2);
+
+    // Action 3: Withdraw (shares count)
+    let shares_to_withdraw = 500;
+    let shares_before = pool_client.get_shares(&user1, &token_id);
+    pool_client.withdraw(&user1, &token_id, &shares_to_withdraw);
+    let shares_after = pool_client.get_shares(&user1, &token_id);
+    assert_eq!(shares_before - shares_to_withdraw, shares_after);
+    let balance_after = pool_client.get_deposit(&user1, &token_id);
+    assert!(balance_after >= 0, "Balance should never be negative");
+    assert_no_value_creation(shares_after, token_client.balance(&pool_id), pool_client.get_total_shares(&token_id), balance_after);
+}
+

@@ -18,7 +18,7 @@ macro_rules! rcall {
     };
 }
 
-#[derive(Arbitrary, Debug)]
+#[derive(Arbitrary, Debug, Clone)]
 enum FuzzAction {
     Deposit { user_id: u8, amount: i128 },
     Withdraw { user_id: u8, amount: i128 },
@@ -26,7 +26,7 @@ enum FuzzAction {
     MultipleOperations { operations: Vec<Operation> },
 }
 
-#[derive(Arbitrary, Debug)]
+#[derive(Arbitrary, Debug, Clone)]
 struct Operation {
     user_id: u8,
     amount: i128,
@@ -43,7 +43,36 @@ fn setup_token_contract<'a>(
     (contract_id.address(), stellar_asset_client, token_client)
 }
 
-fuzz_target!(|data: FuzzAction| {
+fn assert_no_value_creation(shares: i128, pool_balance: i128, total_shares: i128, redeemable: i128) {
+    if total_shares == 0 {
+        assert_eq!(redeemable, 0);
+        return;
+    }
+    if let (Some(lhs), Some(rhs)) = (redeemable.checked_mul(total_shares), shares.checked_mul(pool_balance)) {
+        assert!(lhs <= rhs, "Value creation from rounding detected");
+    } else {
+        let q = shares / total_shares;
+        let r = shares % total_shares;
+        if let Some(term1) = q.checked_mul(pool_balance) {
+            if let Some(term2_num) = r.checked_mul(pool_balance) {
+                let term2 = term2_num / total_shares;
+                if let Some(max_redeemable) = term1.checked_add(term2) {
+                    assert!(redeemable <= max_redeemable, "Value creation from rounding detected");
+                }
+            }
+        }
+    }
+}
+
+macro_rules! safe_call {
+    ($expr:expr) => {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $expr)).unwrap_or_else(|e| {
+            panic!("Unexpected contract panic: {:?}", e);
+        })
+    };
+}
+
+pub fn run_fuzz_logic(data: FuzzAction) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -58,6 +87,9 @@ fuzz_target!(|data: FuzzAction| {
     // 3. Initialize LendingPool with Admin (Contract client wrapper has 1 arg)
     let pool_admin = Address::generate(&env);
     pool_client.initialize(&pool_admin);
+    
+    // Disable withdrawal cooldown so we can test deposits and withdrawals in the same sequence
+    pool_client.set_withdrawal_cooldown(&0);
 
     match data {
         FuzzAction::Deposit { user_id: _, amount } => {
@@ -71,13 +103,30 @@ fuzz_target!(|data: FuzzAction| {
             // Mint tokens to user
             stellar_asset_client.mint(&user, &amount);
 
-            let result = rcall!(&env, pool_client, "deposit", (user, token_id, amount));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rcall!(&env, pool_client, "deposit", (user, token_id, amount))
+            }));
+            let result = match result {
+                Ok(res) => res,
+                Err(err) => {
+                    panic!("Contract deposit panicked unexpectedly: {:?}", err);
+                }
+            };
 
             if result.is_ok() {
-                // Verify invariant: deposit should increase user balance
-                let balance = pool_client.get_deposit(&user, &token_id);
+                // Verify invariants:
+                // 1. Shares minted on deposit must be strictly positive for any positive deposit amount
+                let shares = safe_call!(pool_client.get_shares(&user, &token_id));
+                assert!(shares > 0, "Shares minted on deposit must be strictly positive");
+
+                // 2. get_deposit's redeemable asset value must never be negative
+                let balance = safe_call!(pool_client.get_deposit(&user, &token_id));
                 assert!(balance >= 0, "Balance should never be negative");
-                assert_eq!(balance, amount, "Balance should match deposited amount");
+
+                // 3. Redeemable value must never exceed what is mathematically possible (no value creation from rounding)
+                let cur_total_shares = safe_call!(pool_client.get_total_shares(&token_id));
+                let pool_balance = token_client.balance(&pool_id);
+                assert_no_value_creation(shares, pool_balance, cur_total_shares, balance);
 
                 // Verify pool token balance
                 assert_eq!(
@@ -88,51 +137,75 @@ fuzz_target!(|data: FuzzAction| {
             }
         }
 
-        FuzzAction::Withdraw { user_id: _, amount } => {
+        FuzzAction::Withdraw { user_id: _, amount: shares_to_withdraw } => {
             let user = Address::generate(&env);
 
             // Skip invalid amounts
-            if amount <= 0 {
+            if shares_to_withdraw <= 0 {
                 return;
             }
 
-            // First deposit some amount to allow withdrawal
-            let deposit_amount = match amount.checked_mul(2) {
-                Some(v) => v,
-                None => return,
-            };
+            // First deposit some assets to mint shares to allow withdrawal.
+            // Since it's a fresh pool, depositing `deposit_amount` of assets will mint `deposit_amount` shares.
+            // The minimum initial deposit is 1,000 assets (which mints 1,000 shares).
+            // So we need deposit_amount >= 1,000 and deposit_amount >= shares_to_withdraw.
+            let deposit_amount = std::cmp::max(shares_to_withdraw, 1_000);
             stellar_asset_client.mint(&user, &deposit_amount);
-            pool_client.deposit(&user, &token_id, &deposit_amount);
 
-            let balance_before = pool_client.get_deposit(&user, &token_id);
-            let result = rcall!(&env, pool_client, "withdraw", (user, amount));
+            let dep_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool_client.deposit(&user, &token_id, &deposit_amount)
+            }));
+            if dep_result.is_err() {
+                return;
+            }
+
+            let shares_before = safe_call!(pool_client.get_shares(&user, &token_id));
+
+            // withdraw's parameter is a share count, not an asset amount
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rcall!(&env, pool_client, "withdraw", (user, token_id, shares_to_withdraw))
+            }));
+            let result = match result {
+                Ok(res) => res,
+                Err(err) => {
+                    panic!("Contract withdraw panicked unexpectedly: {:?}", err);
+                }
+            };
 
             if result.is_ok() {
-                let balance_after = pool_client.get_deposit(&user, &token_id);
+                let shares_after = safe_call!(pool_client.get_shares(&user, &token_id));
+                let balance_after = safe_call!(pool_client.get_deposit(&user, &token_id));
 
-                // Verify invariant: balance should decrease by withdrawal amount
+                // Verify invariants:
+                // 1. shares decreased by shares_to_withdraw
                 assert_eq!(
-                    balance_before - amount,
-                    balance_after,
-                    "Balance should decrease by withdrawal amount"
+                    shares_before - shares_to_withdraw,
+                    shares_after,
+                    "Shares should decrease by withdrawal share count"
                 );
+
+                // 2. get_deposit's redeemable asset value must never be negative
                 assert!(balance_after >= 0, "Balance should never be negative");
 
-                // Verify pool token balance
-                assert_eq!(
-                    token_client.balance(&pool_id),
-                    deposit_amount - amount,
-                    "Pool token balance mismatch after withdrawal"
-                );
+                // 3. Redeemable value must never exceed what is mathematically possible (no value creation from rounding)
+                let cur_total_shares = safe_call!(pool_client.get_total_shares(&token_id));
+                let pool_balance = token_client.balance(&pool_id);
+                assert_no_value_creation(shares_after, pool_balance, cur_total_shares, balance_after);
             }
         }
 
         FuzzAction::GetDeposit { user_id: _ } => {
             let user = Address::generate(&env);
-            let balance = pool_client.get_deposit(&user, &token_id);
+            let balance = safe_call!(pool_client.get_deposit(&user, &token_id));
 
             // Verify invariant: balance should never be negative
             assert!(balance >= 0, "Balance should never be negative");
+
+            // Verify no value creation from rounding
+            let shares = safe_call!(pool_client.get_shares(&user, &token_id));
+            let cur_total_shares = safe_call!(pool_client.get_total_shares(&token_id));
+            let pool_balance = token_client.balance(&pool_id);
+            assert_no_value_creation(shares, pool_balance, cur_total_shares, balance);
         }
 
         FuzzAction::MultipleOperations { operations } => {
@@ -151,30 +224,83 @@ fuzz_target!(|data: FuzzAction| {
                     }
 
                     stellar_asset_client.mint(&user_addr, &op.amount);
-                    let result = rcall!(
-                        &env,
-                        pool_client,
-                        "deposit",
-                        (user_addr, token_id, op.amount)
-                    );
+
+                    let shares_before = safe_call!(pool_client.get_shares(&user_addr, &token_id));
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rcall!(
+                            &env,
+                            pool_client,
+                            "deposit",
+                            (user_addr, token_id, op.amount)
+                        )
+                    }));
+                    let result = match result {
+                        Ok(res) => res,
+                        Err(err) => {
+                            panic!("Contract deposit panicked unexpectedly: {:?}", err);
+                        }
+                    };
+
                     if result.is_ok() {
                         total_expected_deposits += op.amount;
+
+                        // Verify invariants:
+                        // 1. Shares minted on deposit must be strictly positive
+                        let shares_after = safe_call!(pool_client.get_shares(&user_addr, &token_id));
+                        assert!(shares_after > shares_before, "Shares minted on deposit must be strictly positive");
+
+                        // 2. get_deposit's redeemable asset value must never be negative
+                        let balance = safe_call!(pool_client.get_deposit(&user_addr, &token_id));
+                        assert!(balance >= 0, "Balance should never be negative");
+
+                        // 3. Redeemable value must never exceed what is mathematically possible (no value creation from rounding)
+                        let cur_total_shares = safe_call!(pool_client.get_total_shares(&token_id));
+                        let pool_balance = token_client.balance(&pool_id);
+                        assert_no_value_creation(shares_after, pool_balance, cur_total_shares, balance);
                     }
                 } else {
-                    if op.amount <= 0 {
+                    let shares_to_withdraw = op.amount;
+                    if shares_to_withdraw <= 0 {
                         continue;
                     }
 
-                    // Attempt withdrawal
-                    let result = rcall!(&env, pool_client, "withdraw", (user_addr, op.amount));
-                    if result.is_ok() {
-                        total_expected_deposits -= op.amount;
-                    } else {
-                        // If it fails, balance should be verified or we just continue
-                        let balance = pool_client.get_deposit(&user_addr, &token_id);
-                        if balance < op.amount {
-                            // Expected failure
+                    let shares_before = safe_call!(pool_client.get_shares(&user_addr, &token_id));
+                    let pool_balance_before = token_client.balance(&pool_id);
+
+                    // withdraw's parameter is a share count, not an asset amount
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rcall!(&env, pool_client, "withdraw", (user_addr, token_id, shares_to_withdraw))
+                    }));
+                    let result = match result {
+                        Ok(res) => res,
+                        Err(err) => {
+                            panic!("Contract withdraw panicked unexpectedly: {:?}", err);
                         }
+                    };
+
+                    if result.is_ok() {
+                        let pool_balance_after = token_client.balance(&pool_id);
+                        let assets_withdrawn = pool_balance_before - pool_balance_after;
+                        total_expected_deposits -= assets_withdrawn;
+
+                        let shares_after = safe_call!(pool_client.get_shares(&user_addr, &token_id));
+                        let balance_after = safe_call!(pool_client.get_deposit(&user_addr, &token_id));
+
+                        // Verify invariants:
+                        // 1. shares decreased by shares_to_withdraw
+                        assert_eq!(
+                            shares_before - shares_to_withdraw,
+                            shares_after,
+                            "Shares should decrease by withdrawal share count"
+                        );
+
+                        // 2. get_deposit's redeemable asset value must never be negative
+                        assert!(balance_after >= 0, "Balance should never be negative");
+
+                        // 3. Redeemable value must never exceed what is mathematically possible (no value creation from rounding)
+                        let cur_total_shares = safe_call!(pool_client.get_total_shares(&token_id));
+                        assert_no_value_creation(shares_after, pool_balance_after, cur_total_shares, balance_after);
                     }
                 }
             }
@@ -186,13 +312,51 @@ fuzz_target!(|data: FuzzAction| {
                 "Total deposits should match pool token balance"
             );
 
-            // Verify all individual balances are non-negative
+            // Verify all individual balances are non-negative and satisfy the no value creation invariant
             for (_, user_addr) in users {
-                assert!(
-                    pool_client.get_deposit(&user_addr, &token_id) >= 0,
-                    "Individual balance should never be negative"
-                );
+                let shares = safe_call!(pool_client.get_shares(&user_addr, &token_id));
+                let balance = safe_call!(pool_client.get_deposit(&user_addr, &token_id));
+                assert!(balance >= 0, "Individual balance should never be negative");
+
+                let cur_total_shares = safe_call!(pool_client.get_total_shares(&token_id));
+                let pool_balance = token_client.balance(&pool_id);
+                assert_no_value_creation(shares, pool_balance, cur_total_shares, balance);
             }
         }
     }
+}
+
+fuzz_target!(|data: FuzzAction| {
+    run_fuzz_logic(data);
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fuzz_sanity() {
+        let test_cases = vec![
+            FuzzAction::Deposit { user_id: 1, amount: 500 }, // < MINIMUM_INITIAL_DEPOSIT (should fail)
+            FuzzAction::Deposit { user_id: 1, amount: 2000 }, // OK
+            FuzzAction::Deposit { user_id: 2, amount: 1500 }, // OK
+            FuzzAction::Withdraw { user_id: 1, amount: 500 }, // OK (withdraws 500 shares)
+            FuzzAction::Withdraw { user_id: 2, amount: 3000 }, // exceeds shares (should fail)
+            FuzzAction::GetDeposit { user_id: 1 },
+            FuzzAction::GetDeposit { user_id: 3 }, // new user (0 shares)
+            FuzzAction::MultipleOperations {
+                operations: vec![
+                    Operation { user_id: 1, amount: 1500, is_deposit: true },
+                    Operation { user_id: 2, amount: 2500, is_deposit: true },
+                    Operation { user_id: 1, amount: 500, is_deposit: false },
+                    Operation { user_id: 2, amount: 1000, is_deposit: false },
+                    Operation { user_id: 3, amount: 100, is_deposit: false }, // should fail
+                ]
+            }
+        ];
+
+        for case in test_cases {
+            run_fuzz_logic(case);
+        }
+    }
+}
