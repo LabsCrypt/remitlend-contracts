@@ -1212,18 +1212,19 @@ impl LoanManager {
         Ok(loan)
     }
 
-    /// Returns the exact current total debt (principal + accrued interest + accrued late fee) for a loan.
-    /// This amount matches exactly what `repay` would charge at the current ledger.
-    pub fn quote_total_debt(env: Env, loan_id: u32) -> Result<i128, LoanError> {
+    /// Returns the loan status without triggering interest/late fee accrual.
+    /// This is a lightweight view function for indexers and frontend queries
+    /// that only need to know the current state of a loan.
+    pub fn get_loan_status(env: Env, loan_id: u32) -> Result<LoanStatus, LoanError> {
         let loan_key = DataKey::Loan(loan_id);
-        let mut loan: Loan = env
+        // Read loan directly without mutating reference to avoid accrual
+        let loan: Loan = env
             .storage()
             .persistent()
             .get(&loan_key)
             .ok_or(LoanError::LoanNotFound)?;
         Self::bump_persistent_ttl(&env, &loan_key);
-        let (total_debt, _) = Self::current_total_debt(&env, &mut loan)?;
-        Ok(total_debt)
+        Ok(loan.status)
     }
 
     pub fn repay(env: Env, borrower: Address, loan_id: u32, amount: i128) -> Result<(), LoanError> {
@@ -2143,6 +2144,32 @@ impl LoanManager {
             .instance()
             .get(&DataKey::BorrowerLoans(borrower))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns loan IDs for a borrower filtered by status, without triggering accrual.
+    /// This allows indexers to query only loans in a specific state.
+    pub fn get_borrower_loans_by_status(
+        env: Env,
+        borrower: Address,
+        status: LoanStatus,
+    ) -> Vec<u32> {
+        Self::bump_instance_ttl(&env);
+        let all_loans: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::BorrowerLoans(borrower.clone()))
+            .unwrap_or(Vec::new(&env));
+        let mut matching_loans = Vec::new(&env);
+        for loan_id in all_loans.iter() {
+            let loan_key = DataKey::Loan(loan_id);
+            if let Some(loan) = env.storage().persistent().get::<DataKey, Loan>(&loan_key) {
+                Self::bump_persistent_ttl(&env, &loan_key);
+                if loan.status == status {
+                    matching_loans.push_back(loan_id);
+                }
+            }
+        }
+        matching_loans
     }
 
     pub fn get_min_score(env: Env) -> u32 {

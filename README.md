@@ -181,45 +181,65 @@ pub fn unlock_nft(env: Env, nft_id: u64)
 **Key Functions**:
 ```rust
 // Initialize the contract
-pub fn initialize(env: Env, admin: Address, pool_address: Address)
+pub fn initialize(
+    env: Env,
+    nft_contract: Address,
+    lending_pool: Address,
+    token: Address,
+    admin: Address
+)
 
 // Request a loan
-pub fn request_loan(
-    env: Env,
-    borrower: Address,
-    nft_id: u64,
-    amount: i128
-) -> u64
+pub fn request_loan(env: Env, borrower: Address, amount: i128, term: u32) -> u32
 
-// Approve a loan
-pub fn approve_loan(env: Env, loan_id: u64)
+// Approve a loan (admin only)
+pub fn approve_loan(env: Env, loan_id: u32)
 
 // Repay loan
-pub fn repay_loan(env: Env, loan_id: u64, amount: i128)
+pub fn repay(env: Env, borrower: Address, loan_id: u32, amount: i128)
 
-// Get loan details
-pub fn get_loan(env: Env, loan_id: u64) -> Loan
+// Cancel pending loan (borrower only)
+pub fn cancel_loan(env: Env, borrower: Address, loan_id: u32)
 
-// Check loan status
-pub fn get_loan_status(env: Env, loan_id: u64) -> LoanStatus
+// Reject pending loan (admin only)
+pub fn reject_loan(env: Env, loan_id: u32, reason: String)
+
+// Get full loan details (triggers accrual)
+pub fn get_loan(env: Env, loan_id: u32) -> Result<Loan, LoanError>
+
+// Get loan status only (no accrual) - lightweight view for indexers
+pub fn get_loan_status(env: Env, loan_id: u32) -> Result<LoanStatus, LoanError>
+
+// Get all loan IDs for a borrower
+pub fn get_borrower_loans(env: Env, borrower: Address) -> Vec<u32>
+
+// Get loan IDs for a borrower filtered by status (no accrual)
+pub fn get_borrower_loans_by_status(env: Env, borrower: Address, status: LoanStatus) -> Vec<u32>
 ```
 
 **Loan States**:
 ```rust
 pub enum LoanStatus {
-    Requested,   // Loan requested, awaiting approval
+    Pending,     // Loan requested, awaiting approval
     Approved,    // Approved, funds disbursed
-    Active,      // Repayment in progress
     Repaid,      // Fully repaid
-    Defaulted,   // Payment missed
+    Defaulted,   // Payment missed, collateral seized
+    Cancelled,   // Cancelled by borrower before approval
+    Rejected,    // Rejected by admin
+    Liquidated,  // Liquidated by liquidator
 }
 ```
 
+**View Functions**:
+- `get_loan_status(loan_id)` - Returns only the status enum without running accrual calculations. Use this for lightweight queries when you only need to know loan state.
+- `get_borrower_loans_by_status(borrower, status)` - Returns loan IDs filtered by status. Useful for indexers to query specific loan states without fetching full loan data.
+
 **Business Logic**:
-- Minimum credit score: 600
-- Maximum loan-to-value: 80%
-- Interest rate: Based on credit score
-- Repayment period: Configurable
+- Minimum credit score: 500 (configurable via `set_min_score`)
+- Maximum loans per borrower: 3 (configurable via `set_max_loans_per_borrower`)
+- Interest rate: Oracle-based or configurable default (1200 BPS)
+- Late fee rate: Configurable (500 BPS default)
+- Maximum extensions: 3 (configurable by calling `extend_loan`)
 
 **Tests**:
 - ✅ Loan request flow
@@ -228,6 +248,8 @@ pub enum LoanStatus {
 - ✅ Low score rejection
 - ✅ Unauthorized repayment prevention
 - ✅ Access controls
+- ✅ get_loan_status returns correct status without accrual
+- ✅ get_borrower_loans_by_status filters correctly
 
 ### 3. Lending Pool Contract
 
